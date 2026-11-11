@@ -474,10 +474,108 @@ async def handle_message_update(data, http_client: httpx.AsyncClient):
     await http_client.post(f"https://discord.com/api/v10/channels/{LOG_CHANNEL_ID}/messages", headers=headers, json={'embeds': [embed]})
     cached['content'] = data.get('content')
 
+# --- GTA 6 Geri Sayım Döngüsü (Her 5 Dakikada Bir) ---
+
+async def gta6_countdown_loop(http_client: httpx.AsyncClient):
+    """Her 5 dakikada bir GTA 6 sayacını kontrol edip emirfurkannn'ın nickini günceller."""
+    logging.info("Starting GTA 6 countdown loop...")
+    headers = {'Authorization': f'Bot {BOT_TOKEN}'}
+    target_ts = 1795035600 # 19 Kasım 2026 00:00:00 UTC+3
+    user_id = '852605079466803232'
+    panel_msg_id = '1570118813066862687'
+
+    await asyncio.sleep(5) # Başlangıçta 5 saniye bekle
+
+    while True:
+        try:
+            state_enabled = True
+            try:
+                r = await http_client.get(f"https://egeva.tr/api/gta6_countdown.json?t={int(time.time())}", timeout=5.0)
+                if r.status_code == 200:
+                    data = r.json()
+                    state_enabled = data.get('enabled', True)
+                    user_id = data.get('user_id', user_id)
+                    panel_msg_id = data.get('panel_message_id', panel_msg_id)
+            except Exception as e:
+                logging.debug(f"GTA6 state fetch error: {e}")
+
+            if not state_enabled:
+                logging.info("GTA 6 countdown is currently paused/disabled.")
+            else:
+                now = time.time()
+                diff = target_ts - now
+                days = max(0, int(diff // 86400))
+                hours = max(0, int((diff % 86400) // 3600))
+                minutes = max(0, int((diff % 3600) // 60))
+
+                if diff <= 0:
+                    new_nick = "GTA 6 Çıktı!"
+                    rem_text = "Süre Doldu!"
+                else:
+                    new_nick = f"GTA 6'ya {days}g {hours}sa {minutes}dk kaldı"
+                    rem_text = f"{days} Gün {hours} Saat {minutes} Dakika"
+
+                # Nick güncelle
+                patch_resp = await http_client.patch(
+                    f"https://discord.com/api/v10/guilds/{GUILD_ID}/members/{user_id}",
+                    headers=headers,
+                    json={'nick': new_nick}
+                )
+                if patch_resp.status_code in (200, 204):
+                    logging.info(f"GTA 6 Nick auto-updated to: {new_nick}")
+
+                # Log kanalındaki paneli de güncelle
+                panel_payload = {
+                    'embeds': [{
+                        'title': '⏱️ GTA 6 Sayaç Kontrol Paneli',
+                        'color': 0x57F287,
+                        'description': (
+                            f"👤 **Hedef Kullanıcı:** <@{user_id}> (`emirfurkannn`)\n"
+                            "🎯 **Hedef:** 19 Kasım 2026 00:00 (GTA 6)\n"
+                            "📊 **Durum:** 🟢 **AKTİF** (Her 5 dakikada bir otomatik güncelleniyor)\n"
+                            f"🏷️ **Güncel Nick:** `{new_nick}`\n"
+                            f"⏳ **Kalan Süre:** `{rem_text}`\n\n"
+                            "*(Aşağıdaki butonları kullanarak otomatik sayacı istediğiniz an durdurabilir veya yeniden başlatabilirsiniz.)*"
+                        ),
+                        'footer': {'text': 'Egeva Bot • GTA 6 Otomatik Nick Sayacı'},
+                        'timestamp': datetime.datetime.now(datetime.timezone.utc).isoformat()
+                    }],
+                    'components': [{
+                        'type': 1,
+                        'components': [
+                            {'type': 2, 'style': 4, 'label': '🔴 Sayacı Durdur', 'custom_id': 'gta6_stop'},
+                            {'type': 2, 'style': 3, 'label': '🟢 Sayacı Başlat', 'custom_id': 'gta6_start'},
+                            {'type': 2, 'style': 2, 'label': '🔄 Şimdi Güncelle', 'custom_id': 'gta6_sync'}
+                        ]
+                    }]
+                }
+                await http_client.patch(
+                    f"https://discord.com/api/v10/channels/{LOG_CHANNEL_ID}/messages/{panel_msg_id}",
+                    headers=headers,
+                    json=panel_payload
+                )
+
+        except Exception as e:
+            logging.error(f"GTA 6 loop error: {e}")
+
+        await asyncio.sleep(300) # Her 5 dakika (300 saniye)
+
 # --- Render Uyanık Tutucu Web Sunucusu ---
 
 async def handle_health_check(request):
     return web.Response(text="Egeva Bot is running 24/7 on Render! Status: OK")
+
+async def keep_awake_pinger():
+    """Render free tier'ın uykuya dalmasını engellemek için her 9 dakikada bir HTTP isteği atar."""
+    await asyncio.sleep(60) # Başlangıçta 1 dk bekle
+    while True:
+        try:
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                r = await client.get("https://egeva-bot.onrender.com/health")
+                logging.info(f"⏰ Keep-Alive Ping gönderildi: {r.status_code} (Render aktif tutuluyor)")
+        except Exception as e:
+            logging.debug(f"Keep-alive ping error: {e}")
+        await asyncio.sleep(540) # Her 9 dakikada bir (15 dk dolmadan)
 
 async def start_web_server():
     app = web.Application()
@@ -488,6 +586,7 @@ async def start_web_server():
     site = web.TCPSite(runner, '0.0.0.0', PORT)
     await site.start()
     logging.info(f"🌐 Health Check Web Server running on port {PORT} for Render!")
+    asyncio.create_task(keep_awake_pinger())
 
 # --- Ana Gateway Döngüsü ---
 
@@ -502,6 +601,9 @@ async def gateway_loop():
         await refresh_invites(http_client)
         await cleanup_orphaned_voice_channels(http_client)
         await catchup_missed_joins(http_client)
+
+        # GTA 6 5 dakikalık geri sayım döngüsü
+        asyncio.create_task(gta6_countdown_loop(http_client))
 
         current_intents = FULL_INTENTS
         backoff = 2
