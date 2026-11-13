@@ -28,7 +28,7 @@ GUILD_ID = '1402730772112216094'
 LOG_CHANNEL_ID = '1569474522095296685'           # 📋・log
 GELEN_GIDEN_CHANNEL_ID = '1402736641214382262'   # 🤪・gelen-giden
 TRIGGER_CHANNEL_ID = '1403757221136957490'       # ➕・Kendi Ses Kanalını Oluştur
-CATEGORY_ID = '1403757883866484768'              # 🎙️・KİŞİSEL SES KANALLARI
+CATEGORY_ID = '1403757219861762200'              # 🔊・SES KANALLARI
 PORT = int(os.environ.get('PORT', 10000))
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -192,7 +192,7 @@ async def cleanup_orphaned_voice_channels(http_client: httpx.AsyncClient):
         if resp.status_code != 200:
             return
         for ch in resp.json():
-            if ch.get('parent_id') == CATEGORY_ID and ch.get('id') != TRIGGER_CHANNEL_ID:
+            if ch.get('type') == 2 and ch.get('parent_id') == CATEGORY_ID and ch.get('id') != TRIGGER_CHANNEL_ID:
                 cid = ch['id']
                 occupied = sum(1 for uid, vcid in voice_states.items() if vcid == cid)
                 if occupied == 0:
@@ -237,7 +237,7 @@ async def check_and_delete_empty_channel(channel_id, http_client: httpx.AsyncCli
     headers = {'Authorization': f'Bot {BOT_TOKEN}'}
     try:
         ch_resp = await http_client.get(f"https://discord.com/api/v10/channels/{channel_id}", headers=headers)
-        if ch_resp.status_code == 200 and ch_resp.json().get('parent_id') == CATEGORY_ID:
+        if ch_resp.status_code == 200 and ch_resp.json().get('type') == 2 and ch_resp.json().get('parent_id') == CATEGORY_ID:
             await http_client.delete(f"https://discord.com/api/v10/channels/{channel_id}", headers=headers)
             active_temp_channels.discard(channel_id)
     except Exception:
@@ -644,7 +644,7 @@ async def gateway_loop():
                                     for vs in d.get('voice_states', []):
                                         voice_states[vs['user_id']] = vs['channel_id']
                                     for ch in d.get('channels', []):
-                                        if ch.get('parent_id') == CATEGORY_ID and ch['id'] != TRIGGER_CHANNEL_ID:
+                                        if ch.get('type') == 2 and ch.get('parent_id') == CATEGORY_ID and ch['id'] != TRIGGER_CHANNEL_ID:
                                             active_temp_channels.add(ch['id'])
                                 elif t == 'GUILD_MEMBER_ADD':
                                     asyncio.create_task(handle_member_join(d, http_client))
