@@ -719,16 +719,19 @@ async def send_youtube_announcement(http_client: httpx.AsyncClient, video_id: st
 
     if is_members_only:
         content = f"<@&{YT_KATIL_ROLE_ID}> Yeni video kanalda, şimdilik üyelere özel!"
+        allowed_mentions = {
+            "roles": [YT_KATIL_ROLE_ID]
+        }
     else:
         content = "@everyone Yeni video kanalda!"
+        allowed_mentions = {
+            "parse": ["everyone"]
+        }
 
     payload = {
         "content": content,
         "embeds": [embed],
-        "allowed_mentions": {
-            "parse": ["everyone", "roles"],
-            "roles": [YT_KATIL_ROLE_ID]
-        }
+        "allowed_mentions": allowed_mentions
     }
 
     url = f"https://discord.com/api/v10/channels/{YT_VIDEO_DUYURU_CHANNEL_ID}/messages"
@@ -760,12 +763,22 @@ async def youtube_checker_loop(http_client: httpx.AsyncClient):
         logging.info("[YouTube] İlk çalıştırma: Kanalın mevcut videoları önbelleğe alınıyor...")
         try:
             current_vids = await fetch_channel_videos(http_client)
-            for vid, vdata in current_vids.items():
+            vid_items = list(current_vids.items())
+            for idx, (vid, vdata) in enumerate(vid_items):
+                # En son 3 videonun üyelik durumunu kontrol et
+                if idx < 3:
+                    s_info = await check_video_status(http_client, vid)
+                    is_mem = s_info.get('status') == 'members_only'
+                    v_title = s_info.get('title') or vdata.get('title') or 'Mevcut Video'
+                else:
+                    is_mem = False
+                    v_title = vdata.get('title') or 'Mevcut Video'
+
                 state[vid] = {
-                    "title": vdata.get('title', ''),
-                    "status": "public",
+                    "title": v_title,
+                    "status": "members_only" if is_mem else "public",
                     "announced_members": True,
-                    "announced_public": True,
+                    "announced_public": not is_mem,
                     "first_seen": time.time()
                 }
             save_youtube_state(state)
