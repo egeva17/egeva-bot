@@ -594,12 +594,28 @@ def save_youtube_state(state):
 
 async def fetch_channel_videos(client: httpx.AsyncClient):
     """
-    Kanalın en son videolarını hem RSS akışından hem de /videos sekmesinden çeker.
-    Üyelere özel erken erişim videoları da /videos sekmesinde yakalanır.
+    Kanalın en son videolarını çeker.
+    Önce /videos sekmesini tarar (böylece en yeni video, üyelere özel olsa dahi en başta yer alır).
+    Ardından RSS akışını tarayarak başlıkları tamamlar.
     """
     videos = {}
 
-    # 1. RSS Akışı (Hızlı ve stabil)
+    # 1. Kanal /videos Sayfası (En yeni videolar en üstte, üyelere özel videolar burada yer alır)
+    try:
+        r_page = await client.get(
+            f'https://www.youtube.com/{YT_CHANNEL_HANDLE}/videos',
+            headers=YT_HEADERS,
+            timeout=12.0
+        )
+        if r_page.status_code == 200:
+            vids = re.findall(r'/watch\?v=([a-zA-Z0-9_-]{11})', r_page.text)
+            for vid in vids:
+                if vid not in videos:
+                    videos[vid] = {'id': vid, 'title': '', 'source': 'page'}
+    except Exception as e:
+        logging.debug(f"[YouTube] Videos page fetch error: {e}")
+
+    # 2. RSS Akışı (Başlıkları zenginleştir ve eksik varsa ekle)
     try:
         r_rss = await client.get(
             f'https://www.youtube.com/feeds/videos.xml?channel_id={YT_CHANNEL_ID}',
@@ -614,24 +630,13 @@ async def fetch_channel_videos(client: httpx.AsyncClient):
                 if vid_m:
                     vid = vid_m.group(1).strip()
                     title = title_m.group(1).strip() if title_m else ''
-                    videos[vid] = {'id': vid, 'title': title, 'source': 'rss'}
+                    if vid in videos:
+                        videos[vid]['title'] = title
+                        videos[vid]['source'] = 'both'
+                    else:
+                        videos[vid] = {'id': vid, 'title': title, 'source': 'rss'}
     except Exception as e:
         logging.debug(f"[YouTube] RSS fetch error: {e}")
-
-    # 2. Kanal /videos Sayfası (Üyelere özel / kilitli videolar burada görünür)
-    try:
-        r_page = await client.get(
-            f'https://www.youtube.com/{YT_CHANNEL_HANDLE}/videos',
-            headers=YT_HEADERS,
-            timeout=12.0
-        )
-        if r_page.status_code == 200:
-            vids = re.findall(r'/watch\?v=([a-zA-Z0-9_-]{11})', r_page.text)
-            for vid in vids:
-                if vid not in videos:
-                    videos[vid] = {'id': vid, 'title': '', 'source': 'page'}
-    except Exception as e:
-        logging.debug(f"[YouTube] Videos page fetch error: {e}")
 
     return videos
 
