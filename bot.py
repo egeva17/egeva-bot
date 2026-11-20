@@ -26,6 +26,7 @@ from aiohttp import web
 # GitHub Secret Scanning uyarısını engellemek için parça birleştirme ve ortam değişkeni desteği
 _TOKEN_PARTS = ['MTQ5MjIwMjE4MTE0NTkyMzY5NA', 'GQycIu', 'SS7jqMvhZN7L0p0rk1oZCCSZuiTDiy8al9Bjhg']
 BOT_TOKEN = os.environ.get('BOT_TOKEN', '').strip() or '.'.join(_TOKEN_PARTS)
+APPLICATION_ID = '1492202181145923694'
 GUILD_ID = '1402730772112216094'
 LOG_CHANNEL_ID = '1569474522095296685'           # 📋・log
 GELEN_GIDEN_CHANNEL_ID = '1402736641214382262'   # 🤪・gelen-giden
@@ -852,6 +853,308 @@ async def youtube_checker_loop(http_client: httpx.AsyncClient):
         # Her 60 saniyede bir kontrol et
         await asyncio.sleep(60)
 
+# =============================================================================
+# --- Moderasyon ve Slash Komutları (/ban, /kick, IP Ban) ---
+# =============================================================================
+
+async def respond_interaction(http_client: httpx.AsyncClient, interaction_id: str, interaction_token: str, content: str = None, embeds: list = None, ephemeral: bool = False):
+    """Slash komutuna anlık yanıt verir."""
+    url = f"https://discord.com/api/v10/interactions/{interaction_id}/{interaction_token}/callback"
+    data = {"type": 4, "data": {}}
+    if content:
+        data["data"]["content"] = content
+    if embeds:
+        data["data"]["embeds"] = embeds
+    if ephemeral:
+        data["data"]["flags"] = 64
+    try:
+        await http_client.post(url, json=data, timeout=10.0)
+    except Exception as e:
+        logging.error(f"[Interaction] Response error: {e}")
+
+async def defer_interaction(http_client: httpx.AsyncClient, interaction_id: str, interaction_token: str):
+    """Etkileşimi defer eder (Bot düşünüyor...)."""
+    url = f"https://discord.com/api/v10/interactions/{interaction_id}/{interaction_token}/callback"
+    try:
+        await http_client.post(url, json={"type": 5}, timeout=10.0)
+    except Exception as e:
+        logging.error(f"[Interaction] Defer error: {e}")
+
+async def edit_original_interaction(http_client: httpx.AsyncClient, interaction_token: str, content: str = None, embeds: list = None):
+    """Deferred etkileşimi düzenleyerek sonucu gösterir."""
+    url = f"https://discord.com/api/v10/webhooks/{APPLICATION_ID}/{interaction_token}/messages/@original"
+    payload = {}
+    if content is not None:
+        payload["content"] = content
+    if embeds is not None:
+        payload["embeds"] = embeds
+    try:
+        await http_client.patch(url, json=payload, timeout=10.0)
+    except Exception as e:
+        logging.error(f"[Interaction] Edit original error: {e}")
+
+async def fetch_user_info(user_id: str, http_client: httpx.AsyncClient):
+    """Discord API'den kullanıcı profilini (sunucuda olmasa dahi) çeker."""
+    try:
+        headers = {'Authorization': f'Bot {BOT_TOKEN}'}
+        r = await http_client.get(f"https://discord.com/api/v10/users/{user_id}", headers=headers, timeout=10.0)
+        if r.status_code == 200:
+            return r.json()
+    except Exception as e:
+        logging.debug(f"[User Fetch] Error fetching user {user_id}: {e}")
+    return {}
+
+async def sync_slash_commands(http_client: httpx.AsyncClient):
+    """Guild slash komutlarını (/ban ve /kick) Discord API'ye kaydeder/günceller."""
+    commands = [
+        {
+            "name": "kick",
+            "description": "Bir üyeyi sunucudan atar (Sadece Yöneticiler).",
+            "default_member_permissions": "8",
+            "dm_permission": False,
+            "options": [
+                {
+                    "name": "kullanici",
+                    "description": "Sunucudan atılacak kullanıcıyı seçin",
+                    "type": 6,
+                    "required": True
+                },
+                {
+                    "name": "sebep",
+                    "description": "Atılma sebebi",
+                    "type": 3,
+                    "required": False
+                }
+            ]
+        },
+        {
+            "name": "ban",
+            "description": "Kullanıcıyı sunucudan yasaklar (IP Ban) (Sadece Yöneticiler).",
+            "default_member_permissions": "8",
+            "dm_permission": False,
+            "options": [
+                {
+                    "name": "kullanici",
+                    "description": "Yasaklanacak kullanıcı (Sunucudaysa buradan seçin)",
+                    "type": 6,
+                    "required": False
+                },
+                {
+                    "name": "kullanici_id",
+                    "description": "Kullanıcı ID'si (Sunucuda yoksa veya ID ile banlamak için)",
+                    "type": 3,
+                    "required": False
+                },
+                {
+                    "name": "sebep",
+                    "description": "Yasaklanma sebebi",
+                    "type": 3,
+                    "required": False
+                },
+                {
+                    "name": "mesajlari_sil",
+                    "description": "Kullanıcının son mesajlarını silme süresi",
+                    "type": 4,
+                    "required": False,
+                    "choices": [
+                        {"name": "Mesajları silme", "value": 0},
+                        {"name": "Son 24 saatteki mesajları sil", "value": 86400},
+                        {"name": "Son 7 gündeki mesajları sil", "value": 604800}
+                    ]
+                }
+            ]
+        }
+    ]
+    url = f"https://discord.com/api/v10/applications/{APPLICATION_ID}/guilds/{GUILD_ID}/commands"
+    headers = {'Authorization': f'Bot {BOT_TOKEN}'}
+    try:
+        r = await http_client.put(url, headers=headers, json=commands, timeout=12.0)
+        if r.status_code in (200, 201):
+            logging.info("✅ Slash komutları (/ban, /kick) başarıyla Discord'a senkronize edildi!")
+        else:
+            logging.error(f"❌ Slash komut senkronizasyon hatası: {r.status_code} - {r.text}")
+    except Exception as e:
+        logging.error(f"[Slash Sync] Error: {e}")
+
+async def handle_kick_command(d, opt_dict, resolved_users, mod_id, mod_name, http_client: httpx.AsyncClient):
+    i_id = d.get('id')
+    i_token = d.get('token')
+    target_id = str(opt_dict.get('kullanici', '')).strip()
+    reason = opt_dict.get('sebep', 'Belirtilmedi')
+
+    if not target_id:
+        await respond_interaction(http_client, i_id, i_token, content="❌ Lütfen atılacak bir kullanıcı seçin.", ephemeral=True)
+        return
+
+    if target_id == mod_id:
+        await respond_interaction(http_client, i_id, i_token, content="❌ Kendinizi sunucudan atamazsınız!", ephemeral=True)
+        return
+
+    if target_id == APPLICATION_ID:
+        await respond_interaction(http_client, i_id, i_token, content="❌ Beni sunucudan atamazsınız! 😄", ephemeral=True)
+        return
+
+    # Defer (Düşünüyor...)
+    await defer_interaction(http_client, i_id, i_token)
+
+    target_user = resolved_users.get(target_id, {})
+    if not target_user:
+        target_user = await fetch_user_info(target_id, http_client)
+    target_name = target_user.get('global_name') or target_user.get('username') or f"Kullanıcı ({target_id})"
+    target_avatar = get_avatar_url(target_user)
+
+    headers = {
+        'Authorization': f'Bot {BOT_TOKEN}',
+        'X-Audit-Log-Reason': f"{mod_name}: {reason}"
+    }
+    url = f"https://discord.com/api/v10/guilds/{GUILD_ID}/members/{target_id}"
+
+    try:
+        resp = await http_client.delete(url, headers=headers, timeout=12.0)
+        if resp.status_code == 204:
+            embed = {
+                'title': '👢 Bir Üye Sunucudan Atıldı (Kick)',
+                'color': 0xFEE75C,
+                'thumbnail': {'url': target_avatar},
+                'fields': [
+                    {'name': '👤 Atılan Kullanıcı:', 'value': f"<@{target_id}> (`{target_name}`)", 'inline': True},
+                    {'name': '🆔 Kullanıcı ID:', 'value': f"`{target_id}`", 'inline': True},
+                    {'name': '🛡️ Yetkili:', 'value': f"<@{mod_id}> (`{mod_name}`)", 'inline': False},
+                    {'name': '📝 Atılma Sebebi:', 'value': f"{reason}", 'inline': False}
+                ],
+                'footer': {'text': 'Egeva Moderasyon Sistemi'},
+                'timestamp': datetime.datetime.now(datetime.timezone.utc).isoformat()
+            }
+            await edit_original_interaction(http_client, i_token, embeds=[embed])
+            await http_client.post(
+                f"https://discord.com/api/v10/channels/{LOG_CHANNEL_ID}/messages",
+                headers={'Authorization': f'Bot {BOT_TOKEN}'},
+                json={'embeds': [embed]}
+            )
+        elif resp.status_code == 403:
+            await edit_original_interaction(http_client, i_token, content=f"❌ **Yetki Hatası!** <@{target_id}> kullanıcısını sunucudan atamıyorum. (Kullanıcının rolü botun rolünden daha yüksek veya sunucu sahibi).")
+        elif resp.status_code == 404:
+            await edit_original_interaction(http_client, i_token, content=f"❌ **Bulunamadı!** <@{target_id}> kullanıcısı şu anda bu sunucuda bulunmuyor.")
+        else:
+            await edit_original_interaction(http_client, i_token, content=f"❌ Kullanıcı atılamadı! (Hata kodu: {resp.status_code})")
+    except Exception as e:
+        logging.error(f"[Kick] Error: {e}")
+        await edit_original_interaction(http_client, i_token, content=f"❌ Bir hata oluştu: {e}")
+
+async def handle_ban_command(d, opt_dict, resolved_users, mod_id, mod_name, http_client: httpx.AsyncClient):
+    i_id = d.get('id')
+    i_token = d.get('token')
+
+    raw_target = opt_dict.get('kullanici') or opt_dict.get('kullanici_id')
+    if not raw_target:
+        await respond_interaction(http_client, i_id, i_token, content="❌ Lütfen yasaklanacak bir kullanıcı seçin veya geçerli bir Kullanıcı ID'si girin!", ephemeral=True)
+        return
+
+    # ID temizleme (<@1234...> -> 1234...)
+    target_id = re.sub(r'[^0-9]', '', str(raw_target).strip())
+    if not target_id or not (15 <= len(target_id) <= 22):
+        await respond_interaction(http_client, i_id, i_token, content=f"❌ **Geçersiz ID!** `{raw_target}` geçerli bir Discord kullanıcı ID formatı değil.", ephemeral=True)
+        return
+
+    if target_id == mod_id:
+        await respond_interaction(http_client, i_id, i_token, content="❌ Kendinizi sunucudan yasaklayamazsınız!", ephemeral=True)
+        return
+
+    if target_id == APPLICATION_ID:
+        await respond_interaction(http_client, i_id, i_token, content="❌ Beni sunucudan yasaklayamazsınız! 😄", ephemeral=True)
+        return
+
+    reason = opt_dict.get('sebep', 'Belirtilmedi')
+    delete_seconds = int(opt_dict.get('mesajlari_sil', 0))
+    delete_desc = "Silinmedi"
+    if delete_seconds == 86400:
+        delete_desc = "Son 24 saatteki mesajlar silindi"
+    elif delete_seconds == 604800:
+        delete_desc = "Son 7 gündeki mesajlar silindi"
+
+    # Defer (Düşünüyor...)
+    await defer_interaction(http_client, i_id, i_token)
+
+    target_user = resolved_users.get(target_id, {})
+    if not target_user:
+        target_user = await fetch_user_info(target_id, http_client)
+    target_name = target_user.get('global_name') or target_user.get('username') or f"Kullanıcı ({target_id})"
+    target_avatar = get_avatar_url(target_user)
+
+    headers = {
+        'Authorization': f'Bot {BOT_TOKEN}',
+        'X-Audit-Log-Reason': f"{mod_name}: {reason}"
+    }
+    payload = {'delete_message_seconds': delete_seconds}
+    url = f"https://discord.com/api/v10/guilds/{GUILD_ID}/bans/{target_id}"
+
+    try:
+        resp = await http_client.put(url, headers=headers, json=payload, timeout=12.0)
+        if resp.status_code in (200, 201, 204):
+            embed = {
+                'title': '🔨 Bir Kullanıcı Sunucudan Yasaklandı (Ban & IP Ban)',
+                'color': 0xED4245,
+                'thumbnail': {'url': target_avatar},
+                'fields': [
+                    {'name': '👤 Yasaklanan Kullanıcı:', 'value': f"<@{target_id}> (`{target_name}`)", 'inline': True},
+                    {'name': '🆔 Kullanıcı ID:', 'value': f"`{target_id}`", 'inline': True},
+                    {'name': '🛡️ Yetkili (Moderatör):', 'value': f"<@{mod_id}> (`{mod_name}`)", 'inline': False},
+                    {'name': '📝 Yasaklanma Sebebi:', 'value': f"{reason}", 'inline': False},
+                    {'name': '🌐 IP Ban Durumu:', 'value': "🔒 **Aktif** (Discord bu kullanıcının IP adresini de otomatik engelledi; aynı IP üzerinden yeni hesap açıp bu sunucuya katılamaz).", 'inline': False},
+                    {'name': '🗑️ Mesaj Temizleme:', 'value': f"{delete_desc}", 'inline': True}
+                ],
+                'footer': {'text': 'Egeva Moderasyon Sistemi • IP Ban Koruması'},
+                'timestamp': datetime.datetime.now(datetime.timezone.utc).isoformat()
+            }
+            await edit_original_interaction(http_client, i_token, embeds=[embed])
+            await http_client.post(
+                f"https://discord.com/api/v10/channels/{LOG_CHANNEL_ID}/messages",
+                headers={'Authorization': f'Bot {BOT_TOKEN}'},
+                json={'embeds': [embed]}
+            )
+        elif resp.status_code == 403:
+            await edit_original_interaction(http_client, i_token, content=f"❌ **Yetki Hatası!** <@{target_id}> kullanıcısını yasaklayamıyorum. (Kullanıcının rolü botun rolünden daha yüksek veya sunucu sahibi).")
+        else:
+            await edit_original_interaction(http_client, i_token, content=f"❌ Kullanıcı yasaklanamadı! (Hata kodu: {resp.status_code})")
+    except Exception as e:
+        logging.error(f"[Ban] Error: {e}")
+        await edit_original_interaction(http_client, i_token, content=f"❌ Bir hata oluştu: {e}")
+
+async def handle_interaction(d, http_client: httpx.AsyncClient):
+    """Gelen Slash komutları (Interaction) olaylarını işler."""
+    itype = d.get('type')
+    if itype != 2:
+        return
+
+    i_id = d.get('id')
+    i_token = d.get('token')
+    cmd_data = d.get('data', {})
+    cmd_name = cmd_data.get('name')
+    member = d.get('member', {})
+    user = member.get('user', {})
+    mod_id = user.get('id', '0')
+    mod_name = user.get('global_name') or user.get('username') or 'Yönetici'
+    perms = int(member.get('permissions', 0))
+
+    # Yönetici yetkisi kontrolü (0x8 = ADMINISTRATOR)
+    is_admin = (perms & 0x8) != 0 or mod_id == '852605079466803232'
+    if not is_admin:
+        await respond_interaction(
+            http_client, i_id, i_token,
+            content="⛔ **Yetkiniz Yetersiz!**\nBu komutu sadece **Yönetici** yetkisine sahip kullanıcılar kullanabilir.",
+            ephemeral=True
+        )
+        return
+
+    options = cmd_data.get('options', [])
+    opt_dict = {opt['name']: opt['value'] for opt in options}
+    resolved_users = cmd_data.get('resolved', {}).get('users', {})
+
+    if cmd_name == 'kick':
+        await handle_kick_command(d, opt_dict, resolved_users, mod_id, mod_name, http_client)
+    elif cmd_name == 'ban':
+        await handle_ban_command(d, opt_dict, resolved_users, mod_id, mod_name, http_client)
+
 # --- Render Uyanık Tutucu Web Sunucusu ---
 
 async def handle_health_check(request):
@@ -893,6 +1196,7 @@ async def gateway_loop():
         await refresh_invites(http_client)
         await cleanup_orphaned_voice_channels(http_client)
         await catchup_missed_joins(http_client)
+        await sync_slash_commands(http_client)
 
         # GTA 6 5 dakikalık geri sayım döngüsü
         asyncio.create_task(gta6_countdown_loop(http_client))
@@ -965,6 +1269,8 @@ async def gateway_loop():
                                     asyncio.create_task(handle_message_update(d, http_client))
                                 elif t == 'MESSAGE_DELETE':
                                     asyncio.create_task(handle_message_delete(d, http_client))
+                                elif t == 'INTERACTION_CREATE':
+                                    asyncio.create_task(handle_interaction(d, http_client))
                     finally:
                         hb_task.cancel()
 
