@@ -753,105 +753,100 @@ async def send_youtube_announcement(http_client: httpx.AsyncClient, video_id: st
         logging.error(f"[YouTube] Duyuru HTTP isteği hatası: {e}")
         return False
 
+async def sync_discord_announcements(http_client: httpx.AsyncClient):
+    """
+    Discord #video-duyuru kanalındaki son mesajları tarayarak
+    hangi videoların duyurulduğunu (üyelere özel / herkese açık) çeker.
+    Bu sayede bot yeniden başlasa bile ASLA eski duyuruları unutmaz veya mükerrer atmaz.
+    """
+    headers = {'Authorization': f'Bot {BOT_TOKEN}'}
+    announced_members = set()
+    announced_public = set()
+    try:
+        r = await http_client.get(
+            f"https://discord.com/api/v10/channels/{YT_VIDEO_DUYURU_CHANNEL_ID}/messages?limit=30",
+            headers=headers,
+            timeout=10.0
+        )
+        if r.status_code == 200:
+            for m in r.json():
+                content = m.get('content', '')
+                for e in m.get('embeds', []):
+                    url = e.get('url', '')
+                    vid_m = re.search(r'youtu\.be/([a-zA-Z0-9_-]{11})', url)
+                    if vid_m:
+                        vid = vid_m.group(1)
+                        footer = e.get('footer', {}).get('text', '')
+                        if 'Üyelere Özel' in footer or 'üyelere özel' in content.lower():
+                            announced_members.add(vid)
+                        if 'Published' in footer or '@everyone' in content:
+                            announced_public.add(vid)
+    except Exception as e:
+        logging.error(f"[YouTube] Discord history sync error: {e}")
+    
+    return announced_members, announced_public
+
 async def youtube_checker_loop(http_client: httpx.AsyncClient):
     """
-    YouTube kanalını (@egevadbd) her 60 saniyede bir kontrol eder.
+    YouTube kanalını (@egevadbd) her 45 saniyede bir kontrol eder.
     1. Video üyelere özel yayınlandığında: @YouTube Katıl rolünü etiketler.
     2. Video herkese açıldığında: @everyone etiketler.
+    Discord kanalındaki geçmiş mesajları baz alarak çalışır; bot yeniden başlasa bile hiçbir duyuruyu kaçırmaz.
     """
-    logging.info("[YouTube] Starting YouTube checker loop for @egevadbd...")
-    await asyncio.sleep(8)
-
-    state = load_youtube_state()
-
-    # İlk çalıştırmada mevcut eski videoları hafızaya al (Spam önleme)
-    if not state:
-        logging.info("[YouTube] İlk çalıştırma: Kanalın mevcut videoları önbelleğe alınıyor...")
-        try:
-            current_vids = await fetch_channel_videos(http_client)
-            vid_items = list(current_vids.items())
-            for idx, (vid, vdata) in enumerate(vid_items):
-                # En son 3 videonun üyelik durumunu kontrol et
-                if idx < 3:
-                    s_info = await check_video_status(http_client, vid)
-                    is_mem = s_info.get('status') == 'members_only'
-                    v_title = s_info.get('title') or vdata.get('title') or 'Mevcut Video'
-                else:
-                    is_mem = False
-                    v_title = vdata.get('title') or 'Mevcut Video'
-
-                state[vid] = {
-                    "title": v_title,
-                    "status": "members_only" if is_mem else "public",
-                    "announced_members": True,
-                    "announced_public": not is_mem,
-                    "first_seen": time.time()
-                }
-            save_youtube_state(state)
-            logging.info(f"[YouTube] Önbellek {len(state)} mevcut video ile başlatıldı. Artık yeni videolar duyurulacak!")
-        except Exception as e:
-            logging.error(f"[YouTube] Başlangıç önbellekleme hatası: {e}")
+    logging.info("[YouTube] Starting bulletproof YouTube checker loop for @egevadbd...")
+    await asyncio.sleep(5)
 
     while True:
         try:
+            # 1. Discord kanalından güncel duyuru durumunu al
+            announced_members, announced_public = await sync_discord_announcements(http_client)
+
+            # 2. YouTube kanalının en son videolarını çek
             current_vids = await fetch_channel_videos(http_client)
-            for vid, vdata in current_vids.items():
-                v_entry = state.get(vid)
+            top_vids = list(current_vids.items())[:5]
 
-                if not v_entry:
-                    # YENİ VİDEO TESPİT EDİLDİ!
-                    logging.info(f"[YouTube] 🔔 Yeni video tespit edildi: {vid}")
-                    status_info = await check_video_status(http_client, vid)
-                    v_title = status_info.get('title') or vdata.get('title') or 'Yeni Video'
-                    v_status = status_info.get('status')
-                    thumb = status_info.get('thumbnail')
+            for idx, (vid, vdata) in enumerate(top_vids):
+                is_mem_ann = vid in announced_members
+                is_pub_ann = vid in announced_public
 
-                    if v_status == 'members_only':
-                        success = await send_youtube_announcement(http_client, vid, v_title, thumb, is_members_only=True)
-                        if success:
-                            state[vid] = {
-                                "title": v_title,
-                                "status": "members_only",
-                                "announced_members": True,
-                                "announced_public": False,
-                                "first_seen": time.time()
-                            }
-                            save_youtube_state(state)
-                    elif v_status == 'public':
+                # Eğer video zaten hem üyelere hem de herkese duyurulduysa, işlem tamamdır
+                if is_pub_ann:
+                    continue
+
+                # Durumunu kontrol et
+                status_info = await check_video_status(http_client, vid)
+                v_title = status_info.get('title') or vdata.get('title') or 'Yeni Video'
+                v_status = status_info.get('status')
+                thumb = status_info.get('thumbnail')
+
+                # Durum 1: Video Üyelere Özel ve henüz üyelere duyurulmamış
+                if v_status == 'members_only' and not is_mem_ann:
+                    logging.info(f"[YouTube] 🌟 Üyelere özel video tespit edildi: {vid} - {v_title}")
+                    success = await send_youtube_announcement(http_client, vid, v_title, thumb, is_members_only=True)
+                    if success:
+                        announced_members.add(vid)
+                        await asyncio.sleep(2)
+
+                # Durum 2: Video Herkese Açık ve henüz herkese duyurulmamış
+                elif v_status == 'public' and not is_pub_ann:
+                    if is_mem_ann or idx == 0:
+                        logging.info(f"[YouTube] 📢 Video herkese açıldı! Duyuru gönderiliyor: {vid} - {v_title}")
                         success = await send_youtube_announcement(http_client, vid, v_title, thumb, is_members_only=False)
                         if success:
-                            state[vid] = {
-                                "title": v_title,
-                                "status": "public",
-                                "announced_members": True,
-                                "announced_public": True,
-                                "first_seen": time.time()
-                            }
-                            save_youtube_state(state)
-                    else:
-                        logging.debug(f"[YouTube] Video {vid} henüz hazır değil ({v_status}), bir sonraki döngüde kontrol edilecek.")
-                else:
-                    # Daha önce üyelere özel duyurulmuş video, şimdi herkese açıldı mı?
-                    if v_entry.get('announced_members') and not v_entry.get('announced_public'):
-                        status_info = await check_video_status(http_client, vid)
-                        v_status = status_info.get('status')
-                        v_title = status_info.get('title') or v_entry.get('title') or 'Yeni Video'
-                        thumb = status_info.get('thumbnail')
+                            announced_public.add(vid)
+                            await asyncio.sleep(2)
 
-                        if v_status == 'public':
-                            logging.info(f"[YouTube] 📢 Üyelere özel video herkese açıldı! @everyone duyuruluyor: {vid}")
-                            success = await send_youtube_announcement(http_client, vid, v_title, thumb, is_members_only=False)
-                            if success:
-                                v_entry['status'] = 'public'
-                                v_entry['announced_public'] = True
-                                state[vid] = v_entry
-                                save_youtube_state(state)
+            # Ayrıca egeva.tr üzerindeki eşitleme servisine de ping at
+            try:
+                await http_client.get("https://egeva.tr/api/youtube_checker.php", timeout=8.0)
+            except Exception:
+                pass
 
         except Exception as e:
-            logging.error(f"[YouTube] Döngü hatası: {e}")
+            logging.error(f"[YouTube] Checker loop error: {e}")
 
-        # Her 60 saniyede bir kontrol et
-        await asyncio.sleep(60)
+        # Her 45 saniyede bir kontrol et
+        await asyncio.sleep(45)
 
 # =============================================================================
 # --- Moderasyon ve Slash Komutları (/ban, /kick, IP Ban) ---
