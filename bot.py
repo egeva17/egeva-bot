@@ -564,289 +564,23 @@ async def gta6_countdown_loop(http_client: httpx.AsyncClient):
         await asyncio.sleep(300) # Her 5 dakika (300 saniye)
 
 # =============================================================================
-# --- YouTube Video Bildirimi (Üyelere Özel + Herkese Açık İki Aşamalı Sistem) ---
+# --- YouTube Senkronizasyon Tetikleyicisi (Tüm Duyurular SADECE Onaylıdır) ---
 # =============================================================================
-YT_CHANNEL_ID = 'UCFCobCtv8WfpQXGufsEoIMA'
-YT_CHANNEL_HANDLE = '@egevadbd'
-YT_VIDEO_DUYURU_CHANNEL_ID = '1402735259635683379'  # 📽️・video-duyuru
-YT_KATIL_ROLE_ID = '1569742571154968758'            # @YouTube Katıl
-YT_STATE_FILE = os.path.join(BASE_DIR, 'youtube_state.json')
-
-YT_HEADERS = {
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-    'Accept-Language': 'tr-TR,tr;q=0.9,en-US;q=0.8,en;q=0.7'
-}
-
-def load_youtube_state():
-    if os.path.exists(YT_STATE_FILE):
-        try:
-            with open(YT_STATE_FILE, 'r', encoding='utf-8') as f:
-                return json.load(f)
-        except Exception as e:
-            logging.error(f"[YouTube] State load error: {e}")
-    return {}
-
-def save_youtube_state(state):
-    try:
-        with open(YT_STATE_FILE, 'w', encoding='utf-8') as f:
-            json.dump(state, f, indent=2, ensure_ascii=False)
-    except Exception as e:
-        logging.error(f"[YouTube] State save error: {e}")
-
-async def fetch_channel_videos(client: httpx.AsyncClient):
+async def youtube_sync_pinger(http_client: httpx.AsyncClient):
     """
-    Kanalın en son videolarını çeker.
-    Önce /videos sekmesini tarar (böylece en yeni video, üyelere özel olsa dahi en başta yer alır).
-    Ardından RSS akışını tarayarak başlıkları tamamlar.
+    Render bulut botu Discord duyuru kanalına KESİNLİKLE doğrudan mesaj atmaz!
+    Sadece egeva.tr üzerindeki güvenli onay mekanizmasını periyodik olarak tetikler.
+    Tüm onay ve duyuru süreci egeva.tr (cPanel) üzerinden Ege'nin buton tıklamasıyla yönetilir.
     """
-    videos = {}
-
-    # 1. Kanal /videos Sayfası (En yeni videolar en üstte, üyelere özel videolar burada yer alır)
-    try:
-        r_page = await client.get(
-            f'https://www.youtube.com/{YT_CHANNEL_HANDLE}/videos',
-            headers=YT_HEADERS,
-            timeout=12.0
-        )
-        if r_page.status_code == 200:
-            vids = re.findall(r'/watch\?v=([a-zA-Z0-9_-]{11})', r_page.text)
-            for vid in vids:
-                if vid not in videos:
-                    videos[vid] = {'id': vid, 'title': '', 'source': 'page'}
-    except Exception as e:
-        logging.debug(f"[YouTube] Videos page fetch error: {e}")
-
-    # 2. RSS Akışı (Başlıkları zenginleştir ve eksik varsa ekle)
-    try:
-        r_rss = await client.get(
-            f'https://www.youtube.com/feeds/videos.xml?channel_id={YT_CHANNEL_ID}',
-            headers=YT_HEADERS,
-            timeout=10.0
-        )
-        if r_rss.status_code == 200:
-            entries = re.findall(r'<entry>.*?</entry>', r_rss.text, re.DOTALL)
-            for e in entries:
-                vid_m = re.search(r'<yt:videoId>(.*?)</yt:videoId>', e)
-                title_m = re.search(r'<title>(.*?)</title>', e)
-                if vid_m:
-                    vid = vid_m.group(1).strip()
-                    title = title_m.group(1).strip() if title_m else ''
-                    if vid in videos:
-                        videos[vid]['title'] = title
-                        videos[vid]['source'] = 'both'
-                    else:
-                        videos[vid] = {'id': vid, 'title': title, 'source': 'rss'}
-    except Exception as e:
-        logging.debug(f"[YouTube] RSS fetch error: {e}")
-
-    return videos
-
-async def check_video_status(client: httpx.AsyncClient, video_id: str):
-    """
-    Videonun durumunu (public vs members_only) ve başlığını tespit eder.
-    """
-    title = ''
-    thumbnail = f'https://i3.ytimg.com/vi/{video_id}/maxresdefault.jpg'
-
-    # oEmbed ile temiz başlık ve thumbnail al
-    try:
-        r_oe = await client.get(
-            f'https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v={video_id}&format=json',
-            headers=YT_HEADERS,
-            timeout=8.0
-        )
-        if r_oe.status_code == 200:
-            oe_data = r_oe.json()
-            title = oe_data.get('title', '')
-            if oe_data.get('thumbnail_url'):
-                thumbnail = oe_data.get('thumbnail_url')
-    except Exception:
-        pass
-
-    # Video sayfasına bakarak oynatılabilirlik durumunu incele
-    try:
-        r_watch = await client.get(
-            f'https://www.youtube.com/watch?v={video_id}',
-            headers=YT_HEADERS,
-            timeout=10.0
-        )
-        if not title:
-            og_t = re.search(r'<meta property="og:title" content="(.*?)">', r_watch.text)
-            if og_t:
-                title = og_t.group(1)
-
-        match = re.search(r'var ytInitialPlayerResponse = ({.*?});(?:var\s|</script>)', r_watch.text)
-        if match:
-            data = json.loads(match.group(1))
-            ps = data.get('playabilityStatus', {})
-            status = ps.get('status', '').upper()
-            reason = (ps.get('reason') or '').lower()
-
-            if status == 'OK':
-                return {'status': 'public', 'title': title, 'thumbnail': thumbnail}
-
-            # Üyelere özel / Katıl kontrolü
-            if any(k in reason for k in ['members-only', 'üyelere', 'katıl', 'join this channel']):
-                return {'status': 'members_only', 'title': title, 'thumbnail': thumbnail}
-            if ps.get('errorScreen', {}).get('ypcOfferRenderer'):
-                return {'status': 'members_only', 'title': title, 'thumbnail': thumbnail}
-            if status in ['UNPLAYABLE', 'LOGIN_REQUIRED']:
-                return {'status': 'members_only', 'title': title, 'thumbnail': thumbnail}
-
-            return {'status': 'other', 'title': title, 'thumbnail': thumbnail}
-    except Exception as e:
-        logging.debug(f"[YouTube] Video {video_id} status check error: {e}")
-
-    return {'status': 'unknown', 'title': title, 'thumbnail': thumbnail}
-
-async def send_youtube_announcement(http_client: httpx.AsyncClient, video_id: str, title: str, thumbnail: str, is_members_only: bool):
-    """Discord #📽️・video-duyuru kanalına duyuru mesajı atar."""
-    headers = {'Authorization': f'Bot {BOT_TOKEN}'}
-    video_url = f"https://youtu.be/{video_id}"
-    clean_title = title or "Yeni Dead by Daylight Videosu"
-
-    embed = {
-        "title": clean_title,
-        "url": video_url,
-        "color": 16711680,  # 0xFF0000 YouTube Kırmızısı
-        "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-        "author": {
-            "name": "Egeva published a new video on YouTube",
-            "url": f"https://www.youtube.com/{YT_CHANNEL_HANDLE}"
-        },
-        "image": {
-            "url": f"https://i3.ytimg.com/vi/{video_id}/maxresdefault.jpg"
-        },
-        "footer": {
-            "text": "⭐ Üyelere Özel • Egeva YouTube" if is_members_only else "Published • Egeva YouTube",
-            "icon_url": "https://sapph.xyz/images/socials/sapphire_youtube.png"
-        }
-    }
-
-    if is_members_only:
-        content = f"<@&{YT_KATIL_ROLE_ID}> Yeni video kanalda, şimdilik üyelere özel!"
-        allowed_mentions = {
-            "roles": [YT_KATIL_ROLE_ID]
-        }
-    else:
-        content = "@everyone Yeni video kanalda!"
-        allowed_mentions = {
-            "parse": ["everyone"]
-        }
-
-    payload = {
-        "content": content,
-        "embeds": [embed],
-        "allowed_mentions": allowed_mentions
-    }
-
-    url = f"https://discord.com/api/v10/channels/{YT_VIDEO_DUYURU_CHANNEL_ID}/messages"
-    try:
-        r = await http_client.post(url, headers=headers, json=payload, timeout=12.0)
-        if r.status_code in (200, 201):
-            logging.info(f"[YouTube] ✅ Duyuru başarıyla gönderildi: {video_id} (üyelere_özel={is_members_only})")
-            return True
-        else:
-            logging.error(f"[YouTube] ❌ Duyuru gönderme hatası: {r.status_code} - {r.text}")
-            return False
-    except Exception as e:
-        logging.error(f"[YouTube] Duyuru HTTP isteği hatası: {e}")
-        return False
-
-async def sync_discord_announcements(http_client: httpx.AsyncClient):
-    """
-    Discord #video-duyuru kanalındaki son mesajları tarayarak
-    hangi videoların duyurulduğunu (üyelere özel / herkese açık) çeker.
-    Bu sayede bot yeniden başlasa bile ASLA eski duyuruları unutmaz veya mükerrer atmaz.
-    """
-    headers = {'Authorization': f'Bot {BOT_TOKEN}'}
-    announced_members = set()
-    announced_public = set()
-    try:
-        r = await http_client.get(
-            f"https://discord.com/api/v10/channels/{YT_VIDEO_DUYURU_CHANNEL_ID}/messages?limit=30",
-            headers=headers,
-            timeout=10.0
-        )
-        if r.status_code == 200:
-            for m in r.json():
-                content = m.get('content', '')
-                for e in m.get('embeds', []):
-                    url = e.get('url', '')
-                    vid_m = re.search(r'youtu\.be/([a-zA-Z0-9_-]{11})', url)
-                    if vid_m:
-                        vid = vid_m.group(1)
-                        footer = e.get('footer', {}).get('text', '')
-                        if 'Üyelere Özel' in footer or 'üyelere özel' in content.lower():
-                            announced_members.add(vid)
-                        if 'Published' in footer or '@everyone' in content:
-                            announced_public.add(vid)
-    except Exception as e:
-        logging.error(f"[YouTube] Discord history sync error: {e}")
-    
-    return announced_members, announced_public
-
-async def youtube_checker_loop(http_client: httpx.AsyncClient):
-    """
-    YouTube kanalını (@egevadbd) her 45 saniyede bir kontrol eder.
-    1. Video üyelere özel yayınlandığında: @YouTube Katıl rolünü etiketler.
-    2. Video herkese açıldığında: @everyone etiketler.
-    Discord kanalındaki geçmiş mesajları baz alarak çalışır; bot yeniden başlasa bile hiçbir duyuruyu kaçırmaz.
-    """
-    logging.info("[YouTube] Starting bulletproof YouTube checker loop for @egevadbd...")
-    await asyncio.sleep(5)
-
+    logging.info("[YouTube] YouTube sync pinger started (delegated to egeva.tr)...")
+    await asyncio.sleep(20)
     while True:
         try:
-            # 1. Discord kanalından güncel duyuru durumunu al
-            announced_members, announced_public = await sync_discord_announcements(http_client)
-
-            # 2. YouTube kanalının en son videolarını çek
-            current_vids = await fetch_channel_videos(http_client)
-            top_vids = list(current_vids.items())[:5]
-
-            for idx, (vid, vdata) in enumerate(top_vids):
-                is_mem_ann = vid in announced_members
-                is_pub_ann = vid in announced_public
-
-                # Eğer video zaten hem üyelere hem de herkese duyurulduysa, işlem tamamdır
-                if is_pub_ann:
-                    continue
-
-                # Durumunu kontrol et
-                status_info = await check_video_status(http_client, vid)
-                v_title = status_info.get('title') or vdata.get('title') or 'Yeni Video'
-                v_status = status_info.get('status')
-                thumb = status_info.get('thumbnail')
-
-                # Durum 1: Video Üyelere Özel ve henüz üyelere duyurulmamış
-                if v_status == 'members_only' and not is_mem_ann:
-                    logging.info(f"[YouTube] 🌟 Üyelere özel video tespit edildi: {vid} - {v_title}")
-                    success = await send_youtube_announcement(http_client, vid, v_title, thumb, is_members_only=True)
-                    if success:
-                        announced_members.add(vid)
-                        await asyncio.sleep(2)
-
-                # Durum 2: Video Herkese Açık ve henüz herkese duyurulmamış
-                elif v_status == 'public' and not is_pub_ann:
-                    if is_mem_ann or idx == 0:
-                        logging.info(f"[YouTube] 📢 Video herkese açıldı! Duyuru gönderiliyor: {vid} - {v_title}")
-                        success = await send_youtube_announcement(http_client, vid, v_title, thumb, is_members_only=False)
-                        if success:
-                            announced_public.add(vid)
-                            await asyncio.sleep(2)
-
-            # Ayrıca egeva.tr üzerindeki eşitleme servisine de ping at
-            try:
-                await http_client.get("https://egeva.tr/api/youtube_checker.php", timeout=8.0)
-            except Exception:
-                pass
-
+            r = await http_client.get("https://egeva.tr/api/youtube_checker.php", timeout=15.0)
+            logging.debug(f"[YouTube] Checker ping status: {r.status_code}")
         except Exception as e:
-            logging.error(f"[YouTube] Checker loop error: {e}")
-
-        # Her 45 saniyede bir kontrol et
-        await asyncio.sleep(45)
+            logging.debug(f"[YouTube] Checker ping error: {e}")
+        await asyncio.sleep(120)
 
 # =============================================================================
 # --- Moderasyon ve Slash Komutları (/ban, /kick, IP Ban) ---
@@ -1131,8 +865,8 @@ async def handle_interaction(d, http_client: httpx.AsyncClient):
     mod_name = user.get('global_name') or user.get('username') or 'Yönetici'
     perms = int(member.get('permissions', 0))
 
-    # Yönetici yetkisi kontrolü (0x8 = ADMINISTRATOR)
-    is_admin = (perms & 0x8) != 0 or mod_id == '852605079466803232'
+    # Yönetici yetkisi kontrolü (0x8 = ADMINISTRATOR veya Sunucu Sahibi Ege)
+    is_admin = (perms & 0x8) != 0 or mod_id == '982357125672095774'
     if not is_admin:
         await respond_interaction(
             http_client, i_id, i_token,
@@ -1196,8 +930,8 @@ async def gateway_loop():
         # GTA 6 5 dakikalık geri sayım döngüsü
         asyncio.create_task(gta6_countdown_loop(http_client))
 
-        # YouTube (@egevadbd) video duyuru döngüsü (Üyelere özel + Herkese açık)
-        asyncio.create_task(youtube_checker_loop(http_client))
+        # YouTube egeva.tr senkronizasyon pinger (KESİNLİKLE doğrudan mesaj atmaz)
+        asyncio.create_task(youtube_sync_pinger(http_client))
 
         current_intents = FULL_INTENTS
         backoff = 2
