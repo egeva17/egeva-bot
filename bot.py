@@ -68,6 +68,8 @@ def get_account_created_timestamp(snowflake_id):
     except Exception:
         return int(time.time())
 
+LOG_IGNORED_USER_IDS = {'408785106942164992'}  # OwO Bot (log kirliliği önlemi)
+
 def cache_message(msg):
     mid = msg.get('id')
     cid = msg.get('channel_id')
@@ -76,6 +78,8 @@ def cache_message(msg):
         return
 
     author = msg.get('author', {})
+    if str(author.get('id', '')) in LOG_IGNORED_USER_IDS:
+        return
     raw_ts = msg.get('timestamp')
     created_ts = int(time.time())
     if raw_ts:
@@ -394,6 +398,9 @@ async def handle_message_delete(data, http_client: httpx.AsyncClient):
 
     if cached:
         author = cached['author']
+        if str(author.get('id', '')) in LOG_IGNORED_USER_IDS:
+            clean_cached_media_for_msg(mid)
+            return
         author_name = author.get('global_name') or author.get('username') or 'Kullanıcı'
         content = cached.get('content', '')
         sent_ts = cached.get('timestamp', int(time.time()))
@@ -460,6 +467,8 @@ async def handle_message_update(data, http_client: httpx.AsyncClient):
         return
 
     author = cached.get('author', {})
+    if str(author.get('id', '')) in LOG_IGNORED_USER_IDS:
+        return
     author_name = author.get('global_name') or author.get('username') or 'Kullanıcı'
     embed = {
         'title': '✏️ Bir Mesaj Düzenlendi',
